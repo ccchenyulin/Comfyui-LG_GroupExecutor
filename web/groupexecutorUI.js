@@ -1,9 +1,12 @@
 import { app } from "../../scripts/app.js";
 import { api } from "../../scripts/api.js";
 import { queueManager } from "./queue_utils.js";
+
 class GroupExecutorUI {
     static DOCK_MARGIN_X = 0;
     static DOCK_MARGIN_Y = 60;
+    static STORAGE_KEY = 'group_executor_favorites'; // 本地存储key
+
     constructor() {
         this.container = null;
         this.isExecuting = false;
@@ -12,12 +15,50 @@ class GroupExecutorUI {
         this.position = { x: 0, y: 0 };
         this.isDragging = false;
         this.dragOffset = { x: 0, y: 0 };
+        this.favorites = this.loadFavorites(); // 加载收藏列表
         this.DOCK_MARGIN_X = GroupExecutorUI.DOCK_MARGIN_X;
         this.DOCK_MARGIN_Y = GroupExecutorUI.DOCK_MARGIN_Y;
         this.createUI();
         this.attachEvents();
         this.container.instance = this;
     }
+
+    // ====================== 收藏功能核心方法 ======================
+    loadFavorites() {
+        try {
+            const stored = localStorage.getItem(GroupExecutorUI.STORAGE_KEY);
+            return stored ? JSON.parse(stored) : [];
+        } catch (e) {
+            console.error('[GroupExecutorUI] 加载收藏失败:', e);
+            return [];
+        }
+    }
+
+    saveFavorites() {
+        try {
+            localStorage.setItem(GroupExecutorUI.STORAGE_KEY, JSON.stringify(this.favorites));
+        } catch (e) {
+            console.error('[GroupExecutorUI] 保存收藏失败:', e);
+        }
+    }
+
+    isFavorite(groupName) {
+        return this.favorites.includes(groupName);
+    }
+
+    toggleFavorite(groupName) {
+        const index = this.favorites.indexOf(groupName);
+        if (index > -1) {
+            this.favorites.splice(index, 1);
+        } else {
+            this.favorites.push(groupName);
+        }
+        this.saveFavorites();
+        this.updateSingleModeList(); // 更新列表
+        this.updateGroupSelects(parseInt(this.container.querySelector('.ge-group-count').value)); // 更新下拉框
+    }
+
+    // ====================== UI创建与事件 ======================
     createUI() {
         this.container = document.createElement('div');
         this.container.className = 'group-executor-ui';
@@ -179,6 +220,10 @@ class GroupExecutorUI {
                 background: #333;
                 border-radius: 4px;
             }
+            .ge-group-item.favorite {
+                border-left: 3px solid #FFD700;
+                background: linear-gradient(90deg, rgba(255,215,0,0.1) 0%, #333 100%);
+            }
             .ge-group-item:last-child {
                 margin-bottom: 0;
             }
@@ -190,6 +235,27 @@ class GroupExecutorUI {
                 display: flex;
                 gap: 10px;
                 margin-left: auto;
+            }
+            .ge-favorite-btn {
+                background: none;
+                border: none;
+                cursor: pointer;
+                font-size: 16px;
+                padding: 0;
+                width: 24px;
+                height: 24px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                opacity: 0.6;
+                transition: opacity 0.2s, transform 0.2s;
+            }
+            .ge-favorite-btn:hover {
+                opacity: 1;
+                transform: scale(1.2);
+            }
+            .ge-favorite-btn.active {
+                opacity: 1;
             }
             .ge-buttons {
                 display: flex;
@@ -396,10 +462,20 @@ class GroupExecutorUI {
             .ge-search-clear:hover {
                 background: #555;
             }
+            .ge-favorites-divider {
+                text-align: center;
+                color: #888;
+                font-size: 12px;
+                margin: 8px 0;
+                padding: 4px 0;
+                border-top: 1px solid #444;
+                border-bottom: 1px solid #444;
+            }
         `;
         document.head.appendChild(style);
         document.body.appendChild(this.container);
     }
+
     attachEvents() {
         const header = this.container.querySelector('.ge-header');
         header.addEventListener('mousedown', (e) => {
@@ -490,6 +566,7 @@ class GroupExecutorUI {
             clearButton.style.display = searchInput.value ? 'block' : 'none';
         });
     }
+
     showDockMenu(button) {
         const existingMenu = document.querySelector('.ge-dock-menu');
         if (existingMenu) {
@@ -531,6 +608,7 @@ class GroupExecutorUI {
             document.addEventListener('click', closeMenu);
         }, 0);
     }
+
     dockTo(position) {
         const style = this.container.style;
         style.transition = 'all 0.3s ease';
@@ -566,23 +644,46 @@ class GroupExecutorUI {
             style.transition = '';
         }, 300);
     }
+
     updateGroupSelects(count) {
         const container = this.container.querySelector('.ge-groups-container');
         container.innerHTML = '';
         const groupNames = this.getGroupNames();
+        
+        // 将收藏组置顶
+        const favoriteGroups = groupNames.filter(name => this.isFavorite(name));
+        const otherGroups = groupNames.filter(name => !this.isFavorite(name));
+        const sortedGroups = [...favoriteGroups, ...otherGroups];
+
         for (let i = 0; i < count; i++) {
             const select = document.createElement('select');
             select.className = 'ge-group-select';
-            select.innerHTML = `
-                <option value="">选择组 #${i + 1}</option>
-                ${groupNames.map(name => `<option value="${name}">${name}</option>`).join('')}
-            `;
+            
+            let optionsHTML = `<option value="">选择组 #${i + 1}</option>`;
+            
+            // 添加收藏组（带⭐标记）
+            if (favoriteGroups.length > 0) {
+                optionsHTML += `<optgroup label="⭐ 收藏组">`;
+                optionsHTML += favoriteGroups.map(name => `<option value="${name}">⭐ ${name}</option>`).join('');
+                optionsHTML += `</optgroup>`;
+            }
+            
+            // 添加其他组
+            if (otherGroups.length > 0) {
+                optionsHTML += `<optgroup label="全部组">`;
+                optionsHTML += otherGroups.map(name => `<option value="${name}">${name}</option>`).join('');
+                optionsHTML += `</optgroup>`;
+            }
+            
+            select.innerHTML = optionsHTML;
             container.appendChild(select);
         }
     }
+
     getGroupNames() {
         return [...app.graph._groups].map(g => g.title).sort();
     }
+
     updateStatus(text, progress = null) {
         const status = this.container.querySelector('.ge-status');
         status.innerHTML = `<span>${text}</span>`;
@@ -590,6 +691,7 @@ class GroupExecutorUI {
             status.style.setProperty('--progress', `${progress}%`);
         }
     }
+
     async executeGroups() {
         if (this.isExecuting) {
             console.warn('[GroupExecutorUI] 已有执行任务在进行中');
@@ -648,6 +750,7 @@ class GroupExecutorUI {
             cancelBtn.disabled = true;
         }
     }
+
     async executeGroup(groupName) {
         const group = app.graph._groups.find(g => g.title === groupName);
         if (!group) {
@@ -680,6 +783,7 @@ class GroupExecutorUI {
             }
         }
     }
+
     async cancelExecution() {
         if (!this.isExecuting) {
             console.warn('[GroupExecutorUI] 没有正在执行的任务');
@@ -694,6 +798,7 @@ class GroupExecutorUI {
             this.updateStatus(`取消失败: ${error.message}`, 0);
         }
     }
+
     async getQueueStatus() {
         try {
             const response = await fetch('/queue');
@@ -718,6 +823,7 @@ class GroupExecutorUI {
             };
         }
     }
+
     async waitForQueue() {
         return new Promise((resolve, reject) => {
             const checkQueue = async () => {
@@ -736,10 +842,12 @@ class GroupExecutorUI {
             checkQueue();
         });
     }
+
     async delay(seconds) {
         if (seconds <= 0) return;
         return new Promise(resolve => setTimeout(resolve, seconds * 1000));
     }
+
     ensureInViewport() {
         const rect = this.container.getBoundingClientRect();
         const windowWidth = window.innerWidth;
@@ -757,6 +865,7 @@ class GroupExecutorUI {
             this.container.style.bottom = `${this.DOCK_MARGIN_Y}px`;
         }
     }
+
     async loadConfigs() {
         try {
             const response = await api.fetchApi('/group_executor/configs', {
@@ -776,6 +885,7 @@ class GroupExecutorUI {
             app.ui.dialog.show('加载配置失败: ' + error.message);
         }
     }
+
     async saveCurrentConfig() {
         const configName = prompt('请输入配置名称:', '新配置');
         if (!configName) return;
@@ -808,6 +918,7 @@ class GroupExecutorUI {
             app.ui.dialog.show('保存配置失败: ' + error.message);
         }
     }
+
     async loadConfig(configName) {
         try {
             const response = await api.fetchApi(`/group_executor/configs/${configName}`, {
@@ -832,6 +943,7 @@ class GroupExecutorUI {
             app.ui.dialog.show('加载配置失败: ' + error.message);
         }
     }
+
     async deleteConfig(configName) {
         if (!configName) return;
         if (!confirm(`确定要删除配置 "${configName}" 吗？`)) {
@@ -852,6 +964,7 @@ class GroupExecutorUI {
             app.ui.dialog.show('删除配置失败: ' + error.message);
         }
     }
+
     switchMode(mode) {
         const multiMode = this.container.querySelector('.ge-multi-mode');
         const singleMode = this.container.querySelector('.ge-single-mode');
@@ -870,6 +983,7 @@ class GroupExecutorUI {
             this.updateSingleModeList();
         }
     }
+
     updateSingleModeList() {
         const container = this.container.querySelector('.ge-groups-list');
         const searchInput = this.container.querySelector('.ge-search-input');
@@ -884,21 +998,41 @@ class GroupExecutorUI {
         };
 
         const renderGroups = (filteredGroups) => {
-            container.innerHTML = filteredGroups.map(name => `
-                <div class="ge-group-item" data-group="${name}">
-                    <span class="ge-group-name">${name}</span>
-                    <div class="ge-group-controls">
-                        <button class="ge-execute-single-btn">执行</button>
-                        <button class="ge-cancel-single-btn" disabled>取消</button>
-                    </div>
-                </div>
-            `).join('');
+            // 将收藏组置顶
+            const favoriteGroups = filteredGroups.filter(name => this.isFavorite(name));
+            const otherGroups = filteredGroups.filter(name => !this.isFavorite(name));
+            
+            let html = '';
+            
+            // 渲染收藏组
+            if (favoriteGroups.length > 0) {
+                html += favoriteGroups.map(name => this.createGroupItemHTML(name, true)).join('');
+            }
+            
+            // 添加分隔线（如果同时有收藏和非收藏组）
+            if (favoriteGroups.length > 0 && otherGroups.length > 0) {
+                html += '<div class="ge-favorites-divider">────────── 其他组 ──────────</div>';
+            }
+            
+            // 渲染其他组
+            html += otherGroups.map(name => this.createGroupItemHTML(name, false)).join('');
+            
+            container.innerHTML = html;
 
+            // 绑定事件
             container.querySelectorAll('.ge-group-item').forEach(item => {
                 const groupName = item.dataset.group;
                 const executeBtn = item.querySelector('.ge-execute-single-btn');
                 const cancelBtn = item.querySelector('.ge-cancel-single-btn');
+                const favoriteBtn = item.querySelector('.ge-favorite-btn');
                 
+                // 收藏按钮事件
+                favoriteBtn.addEventListener('click', (e) => {
+                    e.stopPropagation();
+                    this.toggleFavorite(groupName);
+                });
+                
+                // 执行按钮事件
                 executeBtn.addEventListener('click', async () => {
                     executeBtn.disabled = true;
                     cancelBtn.disabled = false;
@@ -952,7 +1086,24 @@ class GroupExecutorUI {
             renderGroups(groupNames);
         });
     }
+
+    // 创建组项HTML的辅助方法
+    createGroupItemHTML(name, isFavorite) {
+        return `
+            <div class="ge-group-item ${isFavorite ? 'favorite' : ''}" data-group="${name}">
+                <button class="ge-favorite-btn ${isFavorite ? 'active' : ''}" title="${isFavorite ? '取消收藏' : '收藏'}">
+                    ${isFavorite ? '⭐' : '☆'}
+                </button>
+                <span class="ge-group-name">${name}</span>
+                <div class="ge-group-controls">
+                    <button class="ge-execute-single-btn">执行</button>
+                    <button class="ge-cancel-single-btn" disabled>取消</button>
+                </div>
+            </div>
+        `;
+    }
 }
+
 app.registerExtension({
     name: "GroupExecutorUI",
     async setup() {
