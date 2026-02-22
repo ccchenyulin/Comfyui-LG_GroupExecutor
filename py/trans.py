@@ -11,6 +11,7 @@ import json
 from comfy.cli_args import args
 from PIL.PngImagePlugin import PngInfo
 import time
+import cv2  # 视频处理所需
 
 CATEGORY_TYPE = "🎈LAOGOU/Group"
 class AnyType(str):
@@ -221,6 +222,326 @@ class LG_ImageReceiver:
         except Exception as e:
             print(f"[ImageReceiver] 处理图像时出错: {str(e)}")
             return ([], [])
+
+# ==========================================
+# 新增：视频发送/接收节点
+# ==========================================
+class LG_VideoSender:
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.accumulated_results = []
+        
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "frames": ("IMAGE", {"tooltip": "要发送的视频帧序列 (Shape: [Batch, H, W, 3])"}),
+                "filename_prefix": ("STRING", {"default": "lg_video_send"}),
+                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1, "tooltip": "输出视频帧率"}),
+                "accumulate": ("BOOLEAN", {"default": False, "tooltip": "开启后将累积所有视频一起发送"}),
+            },
+            "optional": {
+                "signal_opt": (any_typ, {"tooltip": "信号输入，将在处理完成后原样输出"})
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        }
+
+    RETURN_TYPES = (any_typ,)
+    RETURN_NAMES = ("signal",)
+    FUNCTION = "save_video"
+    CATEGORY = CATEGORY_TYPE
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (True,)
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(s, frames, filename_prefix, link_id, fps, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None):
+        if isinstance(accumulate, list): accumulate = accumulate[0]
+        if accumulate: return float("NaN")
+        return hash(str(frames))
+
+    def save_video(self, frames, filename_prefix, link_id, fps, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None):
+        timestamp = int(time.time() * 1000)
+        results = []
+
+        # 处理列表输入
+        filename_prefix = filename_prefix[0] if isinstance(filename_prefix, list) else filename_prefix
+        link_id = link_id[0] if isinstance(link_id, list) else link_id
+        fps = fps[0] if isinstance(fps, list) else fps
+        accumulate = accumulate[0] if isinstance(accumulate, list) else accumulate
+
+        for idx, frame_batch in enumerate(frames):
+            try:
+                # 转换张量为numpy数组 (Batch, H, W, 3) -> (H, W, 3) * Batch
+                frame_np = frame_batch.cpu().numpy()
+                frame_np = np.clip(255. * frame_np, 0, 255).astype(np.uint8)
+                
+                if frame_np.ndim == 3:  # 单帧图像
+                    frame_np = frame_np[np.newaxis, ...]
+
+                # 获取视频尺寸
+                num_frames, H, W, _ = frame_np.shape
+                
+                # 准备写入器
+                filename = f"{filename_prefix}_{link_id}_{timestamp}_{idx}.mp4"
+                file_path = os.path.join(self.output_dir, filename)
+                
+                # 使用MP4V编码
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(file_path, fourcc, fps, (W, H))
+
+                # 逐帧写入
+                for i in range(num_frames):
+                    # RGB -> BGR
+                    frame_bgr = cv2.cvtColor(frame_np[i], cv2.COLOR_RGB2BGR)
+                    out.write(frame_bgr)
+                
+                out.release()
+
+                video_result = {
+                    "filename": filename,
+                    "subfolder": "",
+                    "type": self.type
+                }
+                results.append(video_result)
+
+                if accumulate:
+                    self.accumulated_results.append(video_result)
+
+            except Exception as e:
+                print(f"[VideoSender] 处理视频 {idx+1} 时出错: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        send_results = self.accumulated_results if accumulate else results
+        
+        if send_results:
+            print(f"[VideoSender] 发送 {len(send_results)} 个视频")
+            PromptServer.instance.send_sync("video-send", {
+                "link_id": link_id,
+                "videos": send_results
+            })
+        
+        if not accumulate:
+            self.accumulated_results = []
+        
+        return { "ui": { "videos": results } }
+
+class LG_VideoReceiver:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "video": ("STRING", {"default": "", "multiline": False, "tooltip": "多个视频文件名用逗号分隔"}),
+                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("frames",)
+    CATEGORY = CATEGORY_TYPE
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "load_video"
+
+    def load_video(self, video, link_id):
+        video_files = [x.strip() for x in video.split(',') if x.strip()]
+        print(f"[VideoReceiver] 加载视频: {video_files}")
+        
+        output_frames = []
+        
+        if not video_files:
+            empty_frames = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+            return ([empty_frames],)
+        
+        try:
+            temp_dir = folder_paths.get_temp_directory()
+            
+            for vid_file in video_files:
+                try:
+                    vid_path = os.path.join(temp_dir, vid_file)
+                    
+                    if not os.path.exists(vid_path):
+                        print(f"[VideoReceiver] 文件不存在: {vid_path}")
+                        continue
+                    
+                    cap = cv2.VideoCapture(vid_path)
+                    frames = []
+                    
+                    while True:
+                        ret, frame = cap.read()
+                        if not ret:
+                            break
+                        # BGR -> RGB
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                        frames.append(frame_rgb)
+                    
+                    cap.release()
+                    
+                    if frames:
+                        # 转换为张量 (Num, H, W, 3)
+                        frames_np = np.stack(frames, axis=0).astype(np.float32) / 255.0
+                        frames_tensor = torch.from_numpy(frames_np)
+                        output_frames.append(frames_tensor)
+                    
+                except Exception as e:
+                    print(f"[VideoReceiver] 处理文件 {vid_file} 时出错: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            return (output_frames if output_frames else [torch.zeros((1, 64, 64, 3), dtype=torch.float32)],)
+
+        except Exception as e:
+            print(f"[VideoReceiver] 处理视频时出错: {str(e)}")
+            return ([torch.zeros((1, 64, 64, 3), dtype=torch.float32)],)
+
+# ==========================================
+# 新增：字符串发送/接收节点
+# ==========================================
+class LG_StringSender:
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.accumulated_results = []
+        
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "text": ("STRING", {"default": "", "multiline": True, "tooltip": "要发送的字符串内容"}),
+                "filename_prefix": ("STRING", {"default": "lg_string_send"}),
+                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
+                "accumulate": ("BOOLEAN", {"default": False, "tooltip": "开启后将累积所有字符串一起发送"}),
+            },
+            "optional": {
+                "signal_opt": (any_typ, {"tooltip": "信号输入，将在处理完成后原样输出"})
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        }
+
+    RETURN_TYPES = (any_typ,)
+    RETURN_NAMES = ("signal",)
+    FUNCTION = "save_string"
+    CATEGORY = CATEGORY_TYPE
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (True,)
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(s, text, filename_prefix, link_id, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None):
+        if isinstance(accumulate, list): accumulate = accumulate[0]
+        if accumulate: return float("NaN")
+        return hash(str(text))
+
+    def save_string(self, text, filename_prefix, link_id, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None):
+        timestamp = int(time.time() * 1000)
+        results = []
+
+        # 处理列表输入
+        filename_prefix = filename_prefix[0] if isinstance(filename_prefix, list) else filename_prefix
+        link_id = link_id[0] if isinstance(link_id, list) else link_id
+        accumulate = accumulate[0] if isinstance(accumulate, list) else accumulate
+        
+        # 确保text是列表
+        if not isinstance(text, list):
+            text = [text]
+
+        for idx, txt in enumerate(text):
+            try:
+                filename = f"{filename_prefix}_{link_id}_{timestamp}_{idx}.txt"
+                file_path = os.path.join(self.output_dir, filename)
+                
+                # 写入文本文件
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    f.write(txt)
+                
+                text_result = {
+                    "filename": filename,
+                    "subfolder": "",
+                    "type": self.type
+                }
+                results.append(text_result)
+
+                if accumulate:
+                    self.accumulated_results.append(text_result)
+
+            except Exception as e:
+                print(f"[StringSender] 处理字符串 {idx+1} 时出错: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        send_results = self.accumulated_results if accumulate else results
+        
+        if send_results:
+            print(f"[StringSender] 发送 {len(send_results)} 个字符串文件")
+            PromptServer.instance.send_sync("string-send", {
+                "link_id": link_id,
+                "strings": send_results
+            })
+        
+        if not accumulate:
+            self.accumulated_results = []
+        
+        # UI显示文本内容预览
+        ui_results = [{"filename": r["filename"], "content": t} for r, t in zip(results, text)]
+        return { "ui": { "strings": ui_results } }
+
+class LG_StringReceiver:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "string": ("STRING", {"default": "", "multiline": False, "tooltip": "多个字符串文件名用逗号分隔"}),
+                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("text",)
+    CATEGORY = CATEGORY_TYPE
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "load_string"
+
+    def load_string(self, string, link_id):
+        string_files = [x.strip() for x in string.split(',') if x.strip()]
+        print(f"[StringReceiver] 加载字符串: {string_files}")
+        
+        output_strings = []
+        
+        if not string_files:
+            return ([""],)
+        
+        try:
+            temp_dir = folder_paths.get_temp_directory()
+            
+            for str_file in string_files:
+                try:
+                    str_path = os.path.join(temp_dir, str_file)
+                    
+                    if not os.path.exists(str_path):
+                        print(f"[StringReceiver] 文件不存在: {str_path}")
+                        continue
+                    
+                    with open(str_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    output_strings.append(content)
+                    
+                except Exception as e:
+                    print(f"[StringReceiver] 处理文件 {str_file} 时出错: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            return (output_strings if output_strings else [""],)
+
+        except Exception as e:
+            print(f"[StringReceiver] 处理字符串时出错: {str(e)}")
+            return ([""],)
 
 class ImageListSplitter:
     @classmethod

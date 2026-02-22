@@ -495,10 +495,12 @@ class GroupExecutorRepeater:
         except Exception as e:
             print(f"重复处理错误: {str(e)}")
             return ([],)
-        
 
-CONFIG_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)), "group_configs")
-os.makedirs(CONFIG_DIR, exist_ok=True)
+# ============ 配置管理接口（支持子目录 + 指定 py/group_configs 目录） ============
+# 定义配置根目录为 当前插件目录/py/group_configs
+PLUGIN_DIR = os.path.dirname(os.path.realpath(__file__))
+CONFIG_ROOT_DIR = os.path.join(PLUGIN_DIR, "group_configs")
+os.makedirs(CONFIG_ROOT_DIR, exist_ok=True)
 
 routes = PromptServer.instance.routes
 
@@ -542,14 +544,30 @@ async def execute_backend(request):
 
 @routes.get("/group_executor/configs")
 async def get_configs(request):
+    """获取配置列表（递归遍历子目录）"""
     try:
-
         configs = []
-        for filename in os.listdir(CONFIG_DIR):
-            if filename.endswith('.json'):
-                configs.append({
-                    "name": filename[:-5]
-                })
+        
+        # 递归遍历目录，包括子目录
+        for root, dirs, files in os.walk(CONFIG_ROOT_DIR):
+            for filename in files:
+                if filename.endswith('.json'):
+                    # 计算相对路径（相对于CONFIG_ROOT_DIR）
+                    rel_path = os.path.relpath(root, CONFIG_ROOT_DIR)
+                    if rel_path == ".":  # 根目录
+                        config_name = filename[:-5]  # 去掉.json后缀
+                        config_path = config_name
+                    else:  # 子目录
+                        config_name = filename[:-5]
+                        config_path = os.path.join(rel_path, config_name)
+                        # 将路径分隔符统一为 /（兼容Windows和Linux）
+                        config_path = config_path.replace(os.sep, "/")
+                    
+                    configs.append({
+                        "name": config_name,
+                        "path": config_path  # 带路径的配置名，如 "subdir/config1"
+                    })
+        
         return web.json_response({"status": "success", "configs": configs})
     except Exception as e:
         print(f"[GroupExecutor] 获取配置失败: {str(e)}")
@@ -557,20 +575,43 @@ async def get_configs(request):
 
 @routes.post("/group_executor/configs")
 async def save_config(request):
+    """保存配置（支持子目录）"""
     try:
         print("[GroupExecutor] 收到保存配置请求")
         data = await request.json()
         config_name = data.get('name')
         if not config_name:
             return web.json_response({"status": "error", "message": "配置名称不能为空"}, status=400)
-            
-        safe_name = "".join(c for c in config_name if c.isalnum() or c in (' ', '-', '_'))
-        filename = os.path.join(CONFIG_DIR, f"{safe_name}.json")
         
-        with open(filename, 'w', encoding='utf-8') as f:
+        # 处理配置路径（支持子目录，如 "subdir/my_config"）
+        # 拆分路径和文件名
+        config_path = os.path.dirname(config_name)
+        config_filename = os.path.basename(config_name)
+        
+        # 过滤非法字符（仅保留字母、数字、空格、-、_、/）
+        safe_path = []
+        for part in config_path.split("/"):
+            safe_part = "".join(c for c in part if c.isalnum() or c in (' ', '-', '_'))
+            if safe_part:
+                safe_path.append(safe_part)
+        
+        safe_filename = "".join(c for c in config_filename if c.isalnum() or c in (' ', '-', '_'))
+        if not safe_filename:
+            return web.json_response({"status": "error", "message": "配置文件名不能为空"}, status=400)
+        
+        # 拼接完整路径
+        if safe_path:
+            full_dir = os.path.join(CONFIG_ROOT_DIR, *safe_path)
+        else:
+            full_dir = CONFIG_ROOT_DIR
+        os.makedirs(full_dir, exist_ok=True)  # 自动创建子目录
+        full_filename = os.path.join(full_dir, f"{safe_filename}.json")
+        
+        # 保存配置文件
+        with open(full_filename, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-            
-        print(f"[GroupExecutor] 配置已保存: {filename}")
+        
+        print(f"[GroupExecutor] 配置已保存: {full_filename}")
         return web.json_response({"status": "success"})
     except json.JSONDecodeError as e:
         print(f"[GroupExecutor] JSON解析错误: {str(e)}")
@@ -583,34 +624,55 @@ async def save_config(request):
 
 @routes.get('/group_executor/configs/{name}')
 async def get_config(request):
+    """加载配置（支持子目录路径）"""
     try:
-        config_name = request.match_info.get('name')
-        if not config_name:
+        config_path = request.match_info.get('name')
+        if not config_path:
             return web.json_response({"error": "配置名称不能为空"}, status=400)
-            
-        filename = os.path.join(CONFIG_DIR, f"{config_name}.json")
-        if not os.path.exists(filename):
+        
+        # 将路径分隔符从 / 转为系统分隔符
+        config_path = config_path.replace("/", os.sep)
+        full_filename = os.path.join(CONFIG_ROOT_DIR, f"{config_path}.json")
+        
+        if not os.path.exists(full_filename):
             return web.json_response({"error": "配置不存在"}, status=404)
-            
-        with open(filename, 'r', encoding='utf-8') as f:
+        
+        with open(full_filename, 'r', encoding='utf-8') as f:
             config = json.load(f)
-            
+        
         return web.json_response(config)
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
 
 @routes.delete('/group_executor/configs/{name}')
 async def delete_config(request):
+    """删除配置（支持子目录路径）"""
     try:
-        config_name = request.match_info.get('name')
-        if not config_name:
+        config_path = request.match_info.get('name')
+        if not config_path:
             return web.json_response({"error": "配置名称不能为空"}, status=400)
-            
-        filename = os.path.join(CONFIG_DIR, f"{config_name}.json")
-        if not os.path.exists(filename):
+        
+        # 将路径分隔符从 / 转为系统分隔符
+        config_path = config_path.replace("/", os.sep)
+        full_filename = os.path.join(CONFIG_ROOT_DIR, f"{config_path}.json")
+        
+        if not os.path.exists(full_filename):
             return web.json_response({"error": "配置不存在"}, status=404)
-            
-        os.remove(filename)
+        
+        os.remove(full_filename)
         return web.json_response({"status": "success"})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
+
+# ============ 注册节点 ============
+NODE_CLASS_MAPPINGS = {
+    "GroupExecutorSingle": GroupExecutorSingle,
+    "GroupExecutorSender": GroupExecutorSender,
+    "GroupExecutorRepeater": GroupExecutorRepeater
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "GroupExecutorSingle": "🎈Group Executor Single",
+    "GroupExecutorSender": "🎈Group Executor Sender",
+    "GroupExecutorRepeater": "🎈Group Executor Repeater"
+}
