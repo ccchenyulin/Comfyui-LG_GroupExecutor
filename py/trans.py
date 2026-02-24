@@ -543,6 +543,170 @@ class LG_StringReceiver:
             print(f"[StringReceiver] 处理字符串时出错: {str(e)}")
             return ([""],)
 
+# 请在文件顶部添加必要的导入
+import torchaudio
+
+# ==========================================
+# 新增：音频发送/接收节点
+# ==========================================
+class LG_audioSender:
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.accumulated_results = []
+        
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio": ("AUDIO", {"tooltip": "要发送的音频"}),
+                "filename_prefix": ("STRING", {"default": "lg_audio_send"}),
+                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
+                "accumulate": ("BOOLEAN", {"default": False, "tooltip": "开启后将累积所有音频一起发送"}),
+            },
+            "optional": {
+                "signal_opt": (any_typ, {"tooltip": "信号输入，将在处理完成后原样输出"})
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        }
+
+    RETURN_TYPES = (any_typ,)
+    RETURN_NAMES = ("signal",)
+    FUNCTION = "save_audio"
+    CATEGORY = CATEGORY_TYPE
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (True,)
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(s, audio, filename_prefix, link_id, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None):
+        if isinstance(accumulate, list):
+            accumulate = accumulate[0]
+        if accumulate:
+            return float("NaN")
+        return hash(str(audio))
+
+    def save_audio(self, audio, filename_prefix, link_id, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None):
+        timestamp = int(time.time() * 1000)
+        results = []
+
+        # 处理列表输入
+        filename_prefix = filename_prefix[0] if isinstance(filename_prefix, list) else filename_prefix
+        link_id = link_id[0] if isinstance(link_id, list) else link_id
+        accumulate = accumulate[0] if isinstance(accumulate, list) else accumulate
+
+        for idx, audio_batch in enumerate(audio):
+            try:
+                # 提取音频数据 (移除batch维度)
+                waveform = audio_batch["waveform"].squeeze(0)
+                sample_rate = audio_batch["sample_rate"]
+
+                # 保存为WAV文件
+                filename = f"{filename_prefix}_{link_id}_{timestamp}_{idx}.wav"
+                file_path = os.path.join(self.output_dir, filename)
+                
+                torchaudio.save(
+                    file_path, 
+                    waveform, 
+                    sample_rate, 
+                    format="wav", 
+                    bits_per_sample=16, 
+                    encoding="PCM_S"
+                )
+
+                audio_result = {
+                    "filename": filename,
+                    "subfolder": "",
+                    "type": self.type
+                }
+                results.append(audio_result)
+
+                if accumulate:
+                    self.accumulated_results.append(audio_result)
+
+            except Exception as e:
+                print(f"[AudioSender] 处理音频 {idx+1} 时出错: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        send_results = self.accumulated_results if accumulate else results
+        
+        if send_results:
+            print(f"[AudioSender] 发送 {len(send_results)} 个音频")
+            PromptServer.instance.send_sync("audio-send", {
+                "link_id": link_id,
+                "audios": send_results
+            })
+        
+        if not accumulate:
+            self.accumulated_results = []
+        
+        return { "ui": { "audios": results } }
+
+class LG_audioReceiver:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio": ("STRING", {"default": "", "multiline": False, "tooltip": "多个音频文件名用逗号分隔"}),
+                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
+            }
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audios",)
+    CATEGORY = CATEGORY_TYPE
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "load_audio"
+
+    def load_audio(self, audio, link_id):
+        audio_files = [x.strip() for x in audio.split(',') if x.strip()]
+        print(f"[AudioReceiver] 加载音频: {audio_files}")
+        
+        output_audios = []
+        
+        # 默认空音频
+        def get_empty_audio():
+            empty_waveform = torch.zeros((1, 1, 44100), dtype=torch.float32)
+            return {"waveform": empty_waveform, "sample_rate": 44100}
+        
+        if not audio_files:
+            return ([get_empty_audio()],)
+        
+        try:
+            temp_dir = folder_paths.get_temp_directory()
+            
+            for aud_file in audio_files:
+                try:
+                    aud_path = os.path.join(temp_dir, aud_file)
+                    
+                    if not os.path.exists(aud_path):
+                        print(f"[AudioReceiver] 文件不存在: {aud_path}")
+                        continue
+                    
+                    # 加载音频并添加batch维度
+                    waveform, sample_rate = torchaudio.load(aud_path)
+                    waveform = waveform.unsqueeze(0)
+                    
+                    output_audio = {
+                        "waveform": waveform,
+                        "sample_rate": sample_rate
+                    }
+                    output_audios.append(output_audio)
+                    
+                except Exception as e:
+                    print(f"[AudioReceiver] 处理文件 {aud_file} 时出错: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            return (output_audios if output_audios else [get_empty_audio()],)
+
+        except Exception as e:
+            print(f"[AudioReceiver] 处理音频时出错: {str(e)}")
+            return ([get_empty_audio()],)
+
 class ImageListSplitter:
     @classmethod
     def INPUT_TYPES(cls):
@@ -1143,3 +1307,4 @@ class LG_ClearAccumulatedValues:
             print(f"[ClearAccumulatedValues] 清空 link_id={link_id} 的累积值")
         
         return (signal_opt,)
+

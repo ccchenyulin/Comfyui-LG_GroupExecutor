@@ -1,44 +1,52 @@
 import { app } from "../../../scripts/app.js";
 import { api } from "../../../scripts/api.js";
 
-// 存储不同 link_id 对应的最新数据
+// 存储不同 link_id 对应的最新数据（新增 audio 缓存）
 const linkDataCache = {
     img: {},
     video: {},
     string: {},
-    value: {}
+    value: {},
+    audio: {} // 新增：音频缓存
 };
 
-// 通用的处理接收消息的函数
+// 通用的处理接收消息的函数（扩展支持 audio 类型）
 function handleReceiveMessage(event, type, widgetName) {
     const data = event.detail;
     const linkId = data.link_id;
     
     console.log(`[LG Frontend] 收到 ${type} 消息 (Link ID: ${linkId})`, data);
 
-    // 1. 缓存数据
+    // 1. 缓存数据（新增 audio 缓存逻辑）
     if (type === 'img') linkDataCache.img[linkId] = data.images;
     else if (type === 'video') linkDataCache.video[linkId] = data.videos;
     else if (type === 'string') linkDataCache.string[linkId] = data.strings;
+    else if (type === 'audio') linkDataCache.audio[linkId] = data.audios; // 新增
 
     // 2. 查找画布上所有对应的接收节点并填充
-    // 注意：这里的 "LG_StringReceiver" 等必须与你 Python 代码中类名完全一致
+    // 注意：这里的节点类型必须与 Python 代码中类名完全一致
     const nodeTypes = {
         img: "LG_ImageReceiver",
         video: "LG_VideoReceiver",
-        string: "LG_StringReceiver"
+        string: "LG_StringReceiver",
+        audio: "LG_audioReceiver" // 新增：音频接收节点类型映射
     };
 
     for (const node of app.graph._nodes) {
         if (node.type === nodeTypes[type]) {
             // 找到节点的 link_id widget
             const linkIdWidget = node.widgets?.find(w => w.name === "link_id");
-            // 找到目标输入 widget (image, video, or string)
+            // 找到目标输入 widget (image/video/string/audio)
             const targetWidget = node.widgets?.find(w => w.name === widgetName);
 
             if (linkIdWidget && targetWidget && linkIdWidget.value === linkId) {
-                // 提取文件名并用逗号连接
-                const files = (type === 'img' ? data.images : (type === 'video' ? data.videos : data.strings));
+                // 提取文件名并用逗号连接（适配 audio 类型的 data.audios 字段）
+                let files = [];
+                if (type === 'img') files = data.images;
+                else if (type === 'video') files = data.videos;
+                else if (type === 'string') files = data.strings;
+                else if (type === 'audio') files = data.audios; // 新增
+                
                 const filenames = files.map(f => f.filename).join(",");
                 
                 console.log(`[LG Frontend] 自动填充节点 ${node.id} 的 ${widgetName}: ${filenames}`);
@@ -113,10 +121,11 @@ app.registerExtension({
     name: "Comfy.LG_GroupExecutor",
     init() {
         console.log("[LG Frontend] 初始化");
-        // 监听后端发来的消息
+        // 监听后端发来的消息（新增 audio-send 监听）
         api.addEventListener("img-send", (e) => handleReceiveMessage(e, "img", "image"));
         api.addEventListener("video-send", (e) => handleReceiveMessage(e, "video", "video"));
         api.addEventListener("string-send", (e) => handleReceiveMessage(e, "string", "string"));
+        api.addEventListener("audio-send", (e) => handleReceiveMessage(e, "audio", "audio")); // 新增：监听音频消息
         api.addEventListener("value-send-accumulate", handleValueMessage);
         api.addEventListener("value-clear-accumulate", handleClearValue);
     },
