@@ -7,7 +7,8 @@ const linkDataCache = {
     video: {},
     string: {},
     value: {},
-    audio: {} // 新增：音频缓存
+    audio: {}, // 新增：音频缓存
+    latent: {} // 新增：Latent 缓存
 };
 
 // 通用的处理接收消息的函数（扩展支持 audio 类型）
@@ -22,6 +23,7 @@ function handleReceiveMessage(event, type, widgetName) {
     else if (type === 'video') linkDataCache.video[linkId] = data.videos;
     else if (type === 'string') linkDataCache.string[linkId] = data.strings;
     else if (type === 'audio') linkDataCache.audio[linkId] = data.audios; // 新增
+    else if (type === 'latent') linkDataCache.latent[linkId] = data.latents; // 新增
 
     // 2. 查找画布上所有对应的接收节点并填充
     // 注意：这里的节点类型必须与 Python 代码中类名完全一致
@@ -29,7 +31,8 @@ function handleReceiveMessage(event, type, widgetName) {
         img: "LG_ImageReceiver",
         video: "LG_VideoReceiver",
         string: "LG_StringReceiver",
-        audio: "LG_audioReceiver" // 新增：音频接收节点类型映射
+        audio: "LG_audioReceiver", // 新增：音频接收节点类型映射
+        latent: "LG_LatentReceiver" // 新增：Latent 接收节点
     };
 
     for (const node of app.graph._nodes) {
@@ -46,6 +49,7 @@ function handleReceiveMessage(event, type, widgetName) {
                 else if (type === 'video') files = data.videos;
                 else if (type === 'string') files = data.strings;
                 else if (type === 'audio') files = data.audios; // 新增
+                else if (type === 'latent') files = data.latents; // 新增
                 
                 const filenames = files.map(f => f.filename).join(",");
                 
@@ -126,6 +130,7 @@ app.registerExtension({
         api.addEventListener("video-send", (e) => handleReceiveMessage(e, "video", "video"));
         api.addEventListener("string-send", (e) => handleReceiveMessage(e, "string", "string"));
         api.addEventListener("audio-send", (e) => handleReceiveMessage(e, "audio", "audio")); // 新增：监听音频消息
+        api.addEventListener("latent-send", (e) => handleReceiveMessage(e, "latent", "latent"));
         api.addEventListener("value-send-accumulate", handleValueMessage);
         api.addEventListener("value-clear-accumulate", handleClearValue);
     },

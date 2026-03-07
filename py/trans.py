@@ -707,6 +707,186 @@ class LG_audioReceiver:
             print(f"[AudioReceiver] 处理音频时出错: {str(e)}")
             return ([get_empty_audio()],)
 
+# ==========================================
+# 新增：Latent 发送/接收节点 (对齐现有代码逻辑)
+# ==========================================
+import comfy.utils
+from comfy.cli_args import args
+import safetensors.torch  # 新增：导入 safetensors
+
+class LG_LatentSender:
+    def __init__(self):
+        self.output_dir = folder_paths.get_temp_directory()
+        self.type = "temp"
+        self.accumulated_results = []
+        
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latents": ("LATENT", {"tooltip": "要发送的Latent数据 (Shape: [samples, height, width])"}),
+                "filename_prefix": ("STRING", {"default": "lg_latent_send"}),
+                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
+                "accumulate": ("BOOLEAN", {"default": False, "tooltip": "开启后将累积所有Latent一起发送"}),
+            },
+            "optional": {
+                "signal_opt": (any_typ, {"tooltip": "信号输入，将在处理完成后原样输出"})
+            },
+            "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        }
+
+    RETURN_TYPES = (any_typ,)
+    RETURN_NAMES = ("signal",)
+    FUNCTION = "save_latent"
+    CATEGORY = CATEGORY_TYPE
+    INPUT_IS_LIST = True
+    OUTPUT_IS_LIST = (True,)
+    OUTPUT_NODE = True
+
+    @classmethod
+    def IS_CHANGED(s, latents, filename_prefix, link_id, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None):
+        if isinstance(accumulate, list): accumulate = accumulate[0]
+        if accumulate: return float("NaN")
+        return hash(str(latents))
+
+    def save_latent(self, latents, filename_prefix, link_id, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None):
+        timestamp = int(time.time() * 1000)
+        results = []
+
+        # 处理列表输入
+        filename_prefix = filename_prefix[0] if isinstance(filename_prefix, list) else filename_prefix
+        link_id = link_id[0] if isinstance(link_id, list) else link_id
+        accumulate = accumulate[0] if isinstance(accumulate, list) else accumulate
+        prompt = prompt[0] if isinstance(prompt, list) else prompt
+        extra_pnginfo = extra_pnginfo[0] if isinstance(extra_pnginfo, list) else extra_pnginfo
+
+        for idx, latent_batch in enumerate(latents):
+            try:
+                if not isinstance(latent_batch, dict) or "samples" not in latent_batch:
+                    print(f"[LatentSender] 无效的Latent数据，跳过索引 {idx}")
+                    continue
+                
+                # 提取核心张量
+                latent_samples = latent_batch["samples"]
+
+                # 保存为.latent文件（对齐官方 SaveLatent + safetensors 格式）
+                filename = f"{filename_prefix}_{link_id}_{timestamp}_{idx}.latent"
+                file_path = os.path.join(self.output_dir, filename)
+                
+                # ---------------- 修正部分开始 ----------------
+                # 1. 构建保存数据（包含版本标记，避免后续需要乘缩放因子）
+                save_dict = {
+                    "latent_tensor": latent_samples.contiguous(),
+                    "latent_format_version_0": torch.tensor([])
+                }
+                
+                # 2. 使用 safetensors.torch.save_file 保存（官方格式）
+                safetensors.torch.save_file(save_dict, file_path)
+                # ---------------- 修正部分结束 ----------------
+
+                # 构建结果对象
+                latent_result = {
+                    "filename": filename,
+                    "subfolder": "",
+                    "type": self.type
+                }
+                results.append(latent_result)
+
+                if accumulate:
+                    self.accumulated_results.append(latent_result)
+
+            except Exception as e:
+                print(f"[LatentSender] 处理Latent {idx+1} 时出错: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                continue
+
+        send_results = self.accumulated_results if accumulate else results
+        
+        if send_results:
+            print(f"[LatentSender] 发送 {len(send_results)} 个Latent文件")
+            PromptServer.instance.send_sync("latent-send", {
+                "link_id": link_id,
+                "latents": send_results
+            })
+        
+        if not accumulate:
+            self.accumulated_results = []
+        
+        return { "ui": { "latents": results } }
+
+import safetensors.torch  # 新增：导入 safetensors
+
+class LG_LatentReceiver:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "latent": ("STRING", {"default": "", "multiline": False, "tooltip": "多个Latent文件名用逗号分隔"}),
+                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
+            }
+        }
+
+    RETURN_TYPES = ("LATENT",)
+    RETURN_NAMES = ("latents",)
+    CATEGORY = CATEGORY_TYPE
+    OUTPUT_IS_LIST = (True,)
+    FUNCTION = "load_latent"
+
+    def load_latent(self, latent, link_id):
+        latent_files = [x.strip() for x in latent.split(',') if x.strip()]
+        print(f"[LatentReceiver] 加载Latent: {latent_files}")
+        
+        output_latents = []
+        
+        # 空数据兜底
+        def get_empty_latent():
+            empty_samples = torch.zeros((1, 4, 64, 64), dtype=torch.float32)
+            return {"samples": empty_samples}
+        
+        if not latent_files:
+            return ([get_empty_latent()],)
+        
+        try:
+            temp_dir = folder_paths.get_temp_directory()
+            
+            for lat_file in latent_files:
+                try:
+                    lat_path = os.path.join(temp_dir, lat_file)
+                    
+                    if not os.path.exists(lat_path):
+                        print(f"[LatentReceiver] 文件不存在: {lat_path}")
+                        continue
+                    
+                    # ---------------- 修正部分开始（完全对齐官方 LoadLatent） ----------------
+                    # 1. 使用 safetensors.torch.load_file 加载
+                    latent_data = safetensors.torch.load_file(lat_path, device="cpu")
+                    
+                    # 2. 处理缩放因子 multiplier
+                    multiplier = 1.0
+                    if "latent_format_version_0" not in latent_data:
+                        multiplier = 1.0 / 0.18215
+                    
+                    # 3. 构建标准 Latent 结构（只需要 "samples" 键）
+                    samples = {
+                        "samples": latent_data["latent_tensor"].float() * multiplier
+                    }
+                    # ---------------- 修正部分结束 ----------------
+                    
+                    output_latents.append(samples)
+                    
+                except Exception as e:
+                    print(f"[LatentReceiver] 处理文件 {lat_file} 时出错: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+            
+            return (output_latents if output_latents else [get_empty_latent()],)
+
+        except Exception as e:
+            print(f"[LatentReceiver] 处理Latent时出错: {str(e)}")
+            return ([get_empty_latent()],)
+
 class ImageListSplitter:
     @classmethod
     def INPUT_TYPES(cls):

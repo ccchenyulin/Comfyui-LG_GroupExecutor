@@ -26,7 +26,9 @@ NODE_CLASS_MAPPINGS = {
     "LG_ValueReceiver": LG_ValueReceiver,
     "LG_ClearAccumulatedValues": LG_ClearAccumulatedValues,
     "LG_audioReceiver": LG_audioReceiver,
-    "LG_audioSender": LG_audioSender
+    "LG_audioSender": LG_audioSender,
+    "LG_LatentSender": LG_LatentSender,
+    "LG_LatentReceiver": LG_LatentReceiver
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "GroupExecutorSingle": "🎈GroupExecutorSingle",
@@ -51,6 +53,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LG_ValueReceiver": "🎈LG_ValueReceiver",
     "LG_ClearAccumulatedValues": "🎈LG_ClearAccumulatedValues",
     "LG_audioReceiver": "LG_audioReceiver",
-    "LG_audioSender": "LG_audioSender"
+    "LG_audioSender": "LG_audioSender",
+    "LG_LatentSender": "LG Latent Sender",
+    "LG_LatentReceiver": "LG Latent Receiver"
 }
 
