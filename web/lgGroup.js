@@ -11,6 +11,15 @@ const linkDataCache = {
     latent: {} // 新增：Latent 缓存
 };
 
+// 需要锁定尺寸的节点类型
+const SIZE_LOCKED_TYPES = new Set([
+    "LG_ValueReceiver",
+    "LG_StringReceiver",
+    "LG_VideoReceiver",
+    "LG_LatentReceiver",
+    "LG_audioReceiver",
+]);
+
 // 通用的处理接收消息的函数（扩展支持 audio 类型）
 function handleReceiveMessage(event, type, widgetName) {
     const data = event.detail;
@@ -56,8 +65,8 @@ function handleReceiveMessage(event, type, widgetName) {
                 console.log(`[LG Frontend] 自动填充节点 ${node.id} 的 ${widgetName}: ${filenames}`);
                 targetWidget.value = filenames;
                 
-                // 触发节点尺寸重绘（防止文字显示不全）
-                node.setSize(node.computeSize());
+                // 仅在需要时重绘，但锁定尺寸不变
+                setNodeSizeLocked(node);
             }
         }
     }
@@ -92,10 +101,24 @@ function handleValueMessage(event) {
                 } else {
                     targetWidget.value = data.value || "";
                 }
-                node.setSize(node.computeSize());
+                // 锁定尺寸，不随内容增多而撑大节点
+                setNodeSizeLocked(node);
             }
         }
     }
+}
+
+/**
+ * 设置节点尺寸，但锁定为初始尺寸，防止内容撑大。
+ * 初始尺寸在节点第一次渲染后记录到 node._lockedSize。
+ */
+function setNodeSizeLocked(node) {
+    if (!node._lockedSize) {
+        // 还没记录过：用当前尺寸作为基准锁定
+        node._lockedSize = [node.size[0], node.size[1]];
+    }
+    node.setSize(node._lockedSize);
+    app.canvas.setDirty(true);
 }
 
 // 处理清空累积
@@ -116,6 +139,8 @@ function handleClearValue(event) {
             const targetWidget = node.widgets?.find(w => w.name === "value");
             if (linkIdWidget && targetWidget && (data.link_id === -1 || linkIdWidget.value === data.link_id)) {
                 targetWidget.value = "";
+                // 清空后也锁定尺寸
+                setNodeSizeLocked(node);
             }
         }
     }
@@ -134,8 +159,16 @@ app.registerExtension({
         api.addEventListener("value-send-accumulate", handleValueMessage);
         api.addEventListener("value-clear-accumulate", handleClearValue);
     },
-    // 当节点被创建时的钩子（可选，用于设置默认值或样式）
+    // 节点创建时记录初始尺寸，作为锁定基准
     nodeCreated(node) {
-        // 可以在这里给特定节点添加一些前端交互逻辑
+        if (SIZE_LOCKED_TYPES.has(node.type)) {
+            // 等待一帧，确保节点已完成初始布局再记录尺寸
+            requestAnimationFrame(() => {
+                if (!node._lockedSize) {
+                    node._lockedSize = [node.size[0], node.size[1]];
+                    console.log(`[LG Frontend] 锁定节点 ${node.id} (${node.type}) 尺寸: ${node._lockedSize}`);
+                }
+            });
+        }
     }
 });
