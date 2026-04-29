@@ -663,6 +663,25 @@ async def delete_config(request):
         return web.json_response({"status": "success"})
     except Exception as e:
         return web.json_response({"error": str(e)}, status=500)
+    
+
+import folder_paths
+
+@PromptServer.instance.routes.get("/laogou/check_temp_file")
+async def laogou_check_temp_file(request):
+    """检查temp目录中的文件是否存在，供前端接收节点状态检测使用"""
+    filename = request.query.get("filename", "").strip()
+    if not filename:
+        return web.json_response({"exists": False})
+    # 防止路径穿越
+    if any(c in filename for c in ('/', '\\', '..')):
+        return web.json_response({"exists": False, "error": "invalid filename"})
+    temp_dir = folder_paths.get_temp_directory()
+    file_path = os.path.join(temp_dir, filename)
+    return web.json_response({
+        "exists": os.path.exists(file_path),
+        "filename": filename
+    })
 
 # ============ 注册节点 ============
 NODE_CLASS_MAPPINGS = {
