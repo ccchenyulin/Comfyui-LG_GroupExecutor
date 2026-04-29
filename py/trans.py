@@ -238,12 +238,14 @@ class LG_VideoSender:
             "required": {
                 "frames": ("IMAGE", {"tooltip": "要发送的视频帧序列 (Shape: [Batch, H, W, 3])"}),
                 "filename_prefix": ("STRING", {"default": "lg_video_send"}),
-                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
-                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1, "tooltip": "输出视频帧率"}),
-                "accumulate": ("BOOLEAN", {"default": False, "tooltip": "开启后将累积所有视频一起发送"}),
+                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1}),
+                "fps": ("FLOAT", {"default": 30.0, "min": 1.0, "max": 120.0, "step": 0.1}),
+                "accumulate": ("BOOLEAN", {"default": False}),
             },
             "optional": {
-                "signal_opt": (any_typ, {"tooltip": "信号输入，将在处理完成后原样输出"})
+                # 新增：每帧遮罩，shape [Batch, H, W]，值域 0-1，0=未遮罩 1=遮罩
+                "masks": ("MASK", {"tooltip": "视频帧遮罩序列，与frames帧数对应"}),
+                "signal_opt": (any_typ,),
             },
             "hidden": {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
         }
@@ -257,16 +259,17 @@ class LG_VideoSender:
     OUTPUT_NODE = True
 
     @classmethod
-    def IS_CHANGED(s, frames, filename_prefix, link_id, fps, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None):
+    def IS_CHANGED(s, frames, filename_prefix, link_id, fps, accumulate,
+                   masks=None, signal_opt=None, prompt=None, extra_pnginfo=None):
         if isinstance(accumulate, list): accumulate = accumulate[0]
         if accumulate: return float("NaN")
-        return hash(str(frames))
+        return hash(str(frames) + str(masks))
 
-    def save_video(self, frames, filename_prefix, link_id, fps, accumulate, signal_opt=None, prompt=None, extra_pnginfo=None):
+    def save_video(self, frames, filename_prefix, link_id, fps, accumulate,
+                   masks=None, signal_opt=None, prompt=None, extra_pnginfo=None):
         timestamp = int(time.time() * 1000)
         results = []
 
-        # 处理列表输入
         filename_prefix = filename_prefix[0] if isinstance(filename_prefix, list) else filename_prefix
         link_id = link_id[0] if isinstance(link_id, list) else link_id
         fps = fps[0] if isinstance(fps, list) else fps
@@ -274,129 +277,170 @@ class LG_VideoSender:
 
         for idx, frame_batch in enumerate(frames):
             try:
-                # 转换张量为numpy数组 (Batch, H, W, 3) -> (H, W, 3) * Batch
                 frame_np = frame_batch.cpu().numpy()
                 frame_np = np.clip(255. * frame_np, 0, 255).astype(np.uint8)
-                
-                if frame_np.ndim == 3:  # 单帧图像
+                if frame_np.ndim == 3:
                     frame_np = frame_np[np.newaxis, ...]
 
-                # 获取视频尺寸
                 num_frames, H, W, _ = frame_np.shape
-                
-                # 准备写入器
+
+                # ---- 保存 RGB 视频 ----
                 filename = f"{filename_prefix}_{link_id}_{timestamp}_{idx}.mp4"
                 file_path = os.path.join(self.output_dir, filename)
-                
-                # 使用MP4V编码
                 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
                 out = cv2.VideoWriter(file_path, fourcc, fps, (W, H))
-
-                # 逐帧写入
                 for i in range(num_frames):
-                    # RGB -> BGR
-                    frame_bgr = cv2.cvtColor(frame_np[i], cv2.COLOR_RGB2BGR)
-                    out.write(frame_bgr)
-                
+                    out.write(cv2.cvtColor(frame_np[i], cv2.COLOR_RGB2BGR))
                 out.release()
+                print(f"[VideoSender] 保存视频: {filename}, 帧数: {num_frames}")
 
-                video_result = {
-                    "filename": filename,
-                    "subfolder": "",
-                    "type": self.type
-                }
+                # ---- 新增：保存遮罩视频（灰度 mp4）----
+                if masks is not None and idx < len(masks):
+                    try:
+                        mask_batch = masks[idx]
+                        mask_np = mask_batch.cpu().numpy()  # [Batch, H, W] 或 [H, W]
+                        if mask_np.ndim == 2:
+                            mask_np = mask_np[np.newaxis, ...]
+                        mask_np = np.clip(mask_np * 255, 0, 255).astype(np.uint8)
+
+                        mask_filename = filename.replace('.mp4', '_mask.mp4')
+                        mask_path = os.path.join(self.output_dir, mask_filename)
+                        # isColor=False 写入灰度视频
+                        mask_out = cv2.VideoWriter(
+                            mask_path, fourcc, fps, (W, H), isColor=False
+                        )
+                        n_mask_frames = min(num_frames, mask_np.shape[0])
+                        for i in range(n_mask_frames):
+                            mask_out.write(mask_np[i])
+                        # 如果mask帧数不够，补最后一帧
+                        for _ in range(num_frames - n_mask_frames):
+                            mask_out.write(mask_np[-1])
+                        mask_out.release()
+                        print(f"[VideoSender] 保存遮罩视频: {mask_filename}")
+                    except Exception as e:
+                        print(f"[VideoSender] 保存遮罩时出错: {str(e)}")
+
+                video_result = {"filename": filename, "subfolder": "", "type": self.type}
                 results.append(video_result)
-
                 if accumulate:
                     self.accumulated_results.append(video_result)
 
             except Exception as e:
                 print(f"[VideoSender] 处理视频 {idx+1} 时出错: {str(e)}")
-                import traceback
-                traceback.print_exc()
-                continue
+                import traceback; traceback.print_exc()
 
         send_results = self.accumulated_results if accumulate else results
-        
         if send_results:
-            print(f"[VideoSender] 发送 {len(send_results)} 个视频")
             PromptServer.instance.send_sync("video-send", {
-                "link_id": link_id,
-                "videos": send_results
+                "link_id": link_id, "videos": send_results
             })
-        
         if not accumulate:
             self.accumulated_results = []
-        
-        return { "ui": { "videos": results } }
+
+        return {"ui": {"videos": results}}
 
 class LG_VideoReceiver:
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "video": ("STRING", {"default": "", "multiline": False, "tooltip": "多个视频文件名用逗号分隔"}),
-                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
+                "video": ("STRING", {"default": "", "multiline": False,
+                          "tooltip": "多个视频文件名用逗号分隔"}),
+                "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1}),
             }
         }
 
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("frames",)
+    # 新增 MASK 输出
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("frames", "masks")
     CATEGORY = CATEGORY_TYPE
-    OUTPUT_IS_LIST = (True,)
+    OUTPUT_IS_LIST = (True, True)
     FUNCTION = "load_video"
 
     def load_video(self, video, link_id):
         video_files = [x.strip() for x in video.split(',') if x.strip()]
         print(f"[VideoReceiver] 加载视频: {video_files}")
-        
-        output_frames = []
-        
-        if not video_files:
-            empty_frames = torch.zeros((1, 64, 64, 3), dtype=torch.float32)
-            return ([empty_frames],)
-        
-        try:
-            temp_dir = folder_paths.get_temp_directory()
-            
-            for vid_file in video_files:
-                try:
-                    vid_path = os.path.join(temp_dir, vid_file)
-                    
-                    if not os.path.exists(vid_path):
-                        print(f"[VideoReceiver] 文件不存在: {vid_path}")
-                        continue
-                    
-                    cap = cv2.VideoCapture(vid_path)
-                    frames = []
-                    
-                    while True:
-                        ret, frame = cap.read()
-                        if not ret:
-                            break
-                        # BGR -> RGB
-                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        frames.append(frame_rgb)
-                    
-                    cap.release()
-                    
-                    if frames:
-                        # 转换为张量 (Num, H, W, 3)
-                        frames_np = np.stack(frames, axis=0).astype(np.float32) / 255.0
-                        frames_tensor = torch.from_numpy(frames_np)
-                        output_frames.append(frames_tensor)
-                    
-                except Exception as e:
-                    print(f"[VideoReceiver] 处理文件 {vid_file} 时出错: {str(e)}")
-                    import traceback
-                    traceback.print_exc()
-                    continue
-            
-            return (output_frames if output_frames else [torch.zeros((1, 64, 64, 3), dtype=torch.float32)],)
 
-        except Exception as e:
-            print(f"[VideoReceiver] 处理视频时出错: {str(e)}")
-            return ([torch.zeros((1, 64, 64, 3), dtype=torch.float32)],)
+        output_frames = []
+        output_masks = []
+        temp_dir = folder_paths.get_temp_directory()
+
+        def empty_frames():
+            return torch.zeros((1, 64, 64, 3), dtype=torch.float32)
+
+        def empty_mask(n, h, w):
+            # 0 = 未遮罩，返回全黑遮罩（无遮罩效果）
+            return torch.zeros((n, h, w), dtype=torch.float32)
+
+        if not video_files:
+            t = empty_frames()
+            return ([t], [empty_mask(1, 64, 64)])
+
+        for vid_file in video_files:
+            try:
+                vid_path = os.path.join(temp_dir, vid_file)
+                if not os.path.exists(vid_path):
+                    print(f"[VideoReceiver] 视频文件不存在: {vid_path}")
+                    continue
+
+                # ---- 加载 RGB 帧 ----
+                cap = cv2.VideoCapture(vid_path)
+                frames = []
+                while True:
+                    ret, frame = cap.read()
+                    if not ret: break
+                    frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+                cap.release()
+
+                if not frames:
+                    continue
+
+                frames_np = np.stack(frames, axis=0).astype(np.float32) / 255.0
+                frames_tensor = torch.from_numpy(frames_np)  # [N, H, W, 3]
+                output_frames.append(frames_tensor)
+                N, H, W, _ = frames_tensor.shape
+
+                # ---- 新增：加载遮罩视频 ----
+                mask_file = vid_file.replace('.mp4', '_mask.mp4')
+                mask_path = os.path.join(temp_dir, mask_file)
+
+                if os.path.exists(mask_path):
+                    cap_mask = cv2.VideoCapture(mask_path)
+                    mask_frames = []
+                    while True:
+                        ret, frame = cap_mask.read()
+                        if not ret: break
+                        # 灰度视频读出来可能是 [H,W] 或 [H,W,1/3]
+                        if frame.ndim == 3:
+                            frame = frame[:, :, 0]
+                        mask_frames.append(frame)
+                    cap_mask.release()
+
+                    if mask_frames:
+                        mask_np = np.stack(mask_frames, axis=0).astype(np.float32) / 255.0
+                        masks_tensor = torch.from_numpy(mask_np)  # [N, H, W]
+                        # 补齐帧数（以防不一致）
+                        if masks_tensor.shape[0] < N:
+                            pad = masks_tensor[-1:].expand(N - masks_tensor.shape[0], H, W)
+                            masks_tensor = torch.cat([masks_tensor, pad], dim=0)
+                        output_masks.append(masks_tensor[:N])
+                        print(f"[VideoReceiver] 已加载遮罩: {mask_file}")
+                    else:
+                        output_masks.append(empty_mask(N, H, W))
+                else:
+                    # 没有遮罩文件，返回空遮罩
+                    output_masks.append(empty_mask(N, H, W))
+                    print(f"[VideoReceiver] 无遮罩文件，使用空遮罩")
+
+            except Exception as e:
+                print(f"[VideoReceiver] 处理 {vid_file} 时出错: {str(e)}")
+                import traceback; traceback.print_exc()
+
+        if not output_frames:
+            t = empty_frames()
+            return ([t], [empty_mask(1, 64, 64)])
+
+        return (output_frames, output_masks)
 
 # ==========================================
 # 新增：字符串发送/接收节点
@@ -824,6 +868,7 @@ class LG_LatentReceiver:
             "required": {
                 "latent": ("STRING", {"default": "", "multiline": False, "tooltip": "多个Latent文件名用逗号分隔"}),
                 "link_id": ("INT", {"default": 1, "min": 0, "max": sys.maxsize, "step": 1, "tooltip": "发送端连接ID"}),
+                "merge_latent": ("BOOLEAN", {"default": False, "tooltip": "如果为True，将多个Latent融合为一个（按batch拼接）"}),
             }
         }
 
@@ -833,55 +878,62 @@ class LG_LatentReceiver:
     OUTPUT_IS_LIST = (True,)
     FUNCTION = "load_latent"
 
-    def load_latent(self, latent, link_id):
+    def load_latent(self, latent, link_id, merge_latent=False):
         latent_files = [x.strip() for x in latent.split(',') if x.strip()]
         print(f"[LatentReceiver] 加载Latent: {latent_files}")
-        
+
         output_latents = []
-        
+
         # 空数据兜底
         def get_empty_latent():
             empty_samples = torch.zeros((1, 4, 64, 64), dtype=torch.float32)
             return {"samples": empty_samples}
-        
+
         if not latent_files:
             return ([get_empty_latent()],)
-        
+
         try:
             temp_dir = folder_paths.get_temp_directory()
-            
+
             for lat_file in latent_files:
                 try:
                     lat_path = os.path.join(temp_dir, lat_file)
-                    
+
                     if not os.path.exists(lat_path):
                         print(f"[LatentReceiver] 文件不存在: {lat_path}")
                         continue
-                    
-                    # ---------------- 修正部分开始（完全对齐官方 LoadLatent） ----------------
-                    # 1. 使用 safetensors.torch.load_file 加载
+
+                    # 使用 safetensors.torch.load_file 加载
                     latent_data = safetensors.torch.load_file(lat_path, device="cpu")
-                    
-                    # 2. 处理缩放因子 multiplier
+
+                    # 处理缩放因子 multiplier
                     multiplier = 1.0
                     if "latent_format_version_0" not in latent_data:
                         multiplier = 1.0 / 0.18215
-                    
-                    # 3. 构建标准 Latent 结构（只需要 "samples" 键）
+
+                    # 构建标准 Latent 结构（只需要 "samples" 键）
                     samples = {
                         "samples": latent_data["latent_tensor"].float() * multiplier
                     }
-                    # ---------------- 修正部分结束 ----------------
-                    
+
                     output_latents.append(samples)
-                    
+
                 except Exception as e:
                     print(f"[LatentReceiver] 处理文件 {lat_file} 时出错: {str(e)}")
                     import traceback
                     traceback.print_exc()
                     continue
-            
-            return (output_latents if output_latents else [get_empty_latent()],)
+
+            # 新增融合逻辑
+            if merge_latent and output_latents:
+                # 提取所有 samples 并沿 batch 维度拼接
+                samples_list = [lat["samples"] for lat in output_latents]
+                merged_samples = torch.cat(samples_list, dim=0)
+                merged_latent = {"samples": merged_samples}
+                return ([merged_latent],)
+            else:
+                # 原有逻辑：返回列表（可能为空时已处理）
+                return (output_latents if output_latents else [get_empty_latent()],)
 
         except Exception as e:
             print(f"[LatentReceiver] 处理Latent时出错: {str(e)}")
