@@ -51,11 +51,12 @@ class QueueManager {
     const originalGraphToPrompt = app.graphToPrompt;
     const originalApiQueuePrompt = api.queuePrompt;
 
+    // FIX 1: 必须 return 原始 Promise，否则调用方拿不到 prompt_id 和后续结果
     app.queuePrompt = async function() {
       this.processingQueue = true;
       this.eventManager.dispatchEvent("queue");
       try {
-        await originalQueuePrompt.apply(app, [...arguments]);
+        return await originalQueuePrompt.apply(app, [...arguments]);
       } finally {
         this.processingQueue = false;
         this.eventManager.dispatchEvent("queue-end");
@@ -70,23 +71,28 @@ class QueueManager {
       return promise;
     }.bind(this);
 
-    api.queuePrompt = async function(index, prompt) {
-      if (this.queueNodeIds && this.queueNodeIds.length && prompt.output) {
+    // FIX 2: api.queuePrompt 不能 .bind(this)，要保持 this 指向 api 对象
+    // 用 self 闭包来访问 QueueManager 实例，避免破坏 ComfyUI 内部上下文
+    // FIX 3: 必须透传 options 参数，新版 ComfyUI 通过它传递 partialExecutionTargets
+    const self = this;
+    api.queuePrompt = async function(index, prompt, options) {
+      if (self.queueNodeIds && self.queueNodeIds.length && prompt.output) {
         const oldOutput = prompt.output;
         let newOutput = {};
-        for (const queueNodeId of this.queueNodeIds) {
-          this.recursiveAddNodes(String(queueNodeId), oldOutput, newOutput);
+        for (const queueNodeId of self.queueNodeIds) {
+          self.recursiveAddNodes(String(queueNodeId), oldOutput, newOutput);
         }
         prompt.output = newOutput;
       }
-      this.eventManager.dispatchEvent("comfy-api-queue-prompt-before", {
+      self.eventManager.dispatchEvent("comfy-api-queue-prompt-before", {
         workflow: prompt.workflow,
         output: prompt.output,
       });
-      const response = originalApiQueuePrompt.apply(api, [index, prompt]);
-      this.eventManager.dispatchEvent("comfy-api-queue-prompt-end");
+      // ✅ FIX: 透传 options 参数，否则 partialExecutionTargets 会丢失
+      const response = originalApiQueuePrompt.apply(api, [index, prompt, options]);
+      self.eventManager.dispatchEvent("comfy-api-queue-prompt-end");
       return response;
-    }.bind(this);
+    };
 
     const originalProcessMouseDown = LGraphCanvas.prototype.processMouseDown;
     const originalAdjustMouseEvent = LGraphCanvas.prototype.adjustMouseEvent;
@@ -213,5 +219,4 @@ function queueGroupOutputNodes() {
   queueManager.queueOutputNodes(outputNodes.map((n) => n.id));
 }
 
-export { queueManager, getOutputNodes, queueSelectedOutputNodes, queueGroupOutputNodes }; 
-
+export { queueManager, getOutputNodes, queueSelectedOutputNodes, queueGroupOutputNodes };
